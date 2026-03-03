@@ -12,6 +12,7 @@ from nano_qwen3tts_vllm.config import Qwen3TTSConfig
 from nano_qwen3tts_vllm.models.qwen3_tts_talker import Qwen3TTSTalkerForCausalLM
 from nano_qwen3tts_vllm.engine.sequence import Sequence, SequenceStatus
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
+from nano_qwen3tts_vllm.layers.sampler import Sampler
 
 from nano_qwen3tts_vllm.utils.context import set_context, get_context, reset_context
 from nano_qwen3tts_vllm.config import Config
@@ -30,6 +31,34 @@ class TalkerModeModelRunner(ModelRunner):
         
         # if not config.enforce_eager:
         #     self.capture_cudagraph_prefill()
+
+    def post_init(self, rank: int):
+        """Override base post_init to create Sampler with suppress_tokens."""
+        default_dtype = torch.get_default_dtype()
+        vocab_size = self.model_config.vocab_size
+        eos_id = self.model_config.codec_eos_token_id
+        suppress_tokens = [
+            i for i in range(vocab_size - 1024, vocab_size)
+            if i != eos_id
+        ]
+        logger.info(
+            "Talker sampler: suppress %d tokens [%d..%d] except EOS=%d",
+            len(suppress_tokens), vocab_size - 1024, vocab_size - 1, eos_id,
+        )
+        self.sampler = Sampler(suppress_tokens=suppress_tokens)
+        self.warmup_model()
+        self.allocate_kv_cache()
+        if not self.enforce_eager:
+            self.capture_cudagraph()
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(default_dtype)
+
+        if self.world_size > 1:
+            from multiprocessing.shared_memory import SharedMemory
+            if rank == 0:
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+            else:
+                self.shm = SharedMemory(name="nanovllm", create=False)
 
     def load_model(self, config: Config):
         with open(os.path.join(config.model, "config.json"), "r") as f:

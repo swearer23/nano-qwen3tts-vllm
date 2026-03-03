@@ -827,7 +827,7 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
     
@@ -1060,7 +1060,7 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
     
@@ -1123,7 +1123,7 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
 
@@ -1160,7 +1160,7 @@ class Qwen3TTSInterface:
         if self.zmq_bridge is not None:
             raise RuntimeError("When using ZMQ bridge use generate_async() after await start_zmq_tasks()")
         request_id = request_id or str(uuid.uuid4())
-        talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
+        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
         predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
         yield from self._generate_caller_driven(
             inputs_embeds, trailing_text_hiddens, tts_pad_embed,
@@ -1178,7 +1178,7 @@ class Qwen3TTSInterface:
         """Async generator of codebook_id chunks. ZMQ path; step() runs as asyncio tasks. Call await start_zmq_tasks() first."""
         if self.zmq_bridge is None:
             raise RuntimeError("generate_async requires zmq_bridge")
-        talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
+        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
         predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
         request_id = request_id or str(uuid.uuid4())
         request_queue: asyncio.Queue = asyncio.Queue()
