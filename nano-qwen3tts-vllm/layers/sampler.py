@@ -14,8 +14,35 @@ class Sampler(nn.Module):
         else:
             self._suppress_ids = None
 
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, top_k: int = 50, top_p: float = 1.0):
+    def _apply_repetition_penalty(
+        self,
+        logits: torch.Tensor,
+        output_tokens: list[list[int]],
+        penalty: float,
+    ) -> torch.Tensor:
+        """Apply repetition penalty per-row: tokens already generated get their logits divided/multiplied by penalty."""
+        for i, tokens in enumerate(output_tokens):
+            if not tokens:
+                continue
+            token_ids = torch.tensor(tokens, dtype=torch.long, device=logits.device).unique()
+            score = logits[i, token_ids]
+            # HuggingFace convention: positive logits get divided, negative get multiplied
+            logits[i, token_ids] = torch.where(score > 0, score / penalty, score * penalty)
+        return logits
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        output_tokens: list[list[int]] | None = None,
+        repetition_penalty: float = 1.0,
+    ):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
+
+        if repetition_penalty != 1.0 and output_tokens is not None:
+            logits = self._apply_repetition_penalty(logits, output_tokens, repetition_penalty)
 
         if self._suppress_ids is not None:
             logits[:, self._suppress_ids] = float("-inf")
