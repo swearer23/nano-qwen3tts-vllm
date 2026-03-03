@@ -405,7 +405,7 @@ class Qwen3TTSInterface:
         try:
             # Try to load speech tokenizer
             if HAS_SPEECH_TOKENIZER:
-                self.speech_tokenizer = SpeechTokenizer("Qwen/Qwen3-TTS-Tokenizer-12Hz", dtype=torch.bfloat16)
+                self.speech_tokenizer = SpeechTokenizer("Qwen/Qwen3-TTS-Tokenizer-12Hz", dtype=torch.float32)
             
             # Try to load speaker encoder from model
             # Check if speaker_encoder exists in the model
@@ -438,10 +438,7 @@ class Qwen3TTSInterface:
                 device_map="cpu",  # Load to CPU first
             )
             if hasattr(temp_model, 'speaker_encoder') and temp_model.speaker_encoder is not None:
-                self.speaker_encoder = temp_model.speaker_encoder.to(self.device)
-                # Get dtype from model
-                if hasattr(temp_model, 'dtype'):
-                    self.speaker_encoder = self.speaker_encoder.to(temp_model.dtype)
+                self.speaker_encoder = temp_model.speaker_encoder.to(self.device).to(torch.float32)
                 return self.speaker_encoder
             else:
                 self._speaker_encoder_available = False
