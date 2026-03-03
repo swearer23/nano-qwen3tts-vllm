@@ -615,7 +615,8 @@ class Qwen3TTSInterface:
         # mel_basis shape: [num_mels, freq_bins]
         # Result: [batch, num_mels, time] or [num_mels, time]
         mel_spec = torch.matmul(mel_basis, spec)  # matmul handles batch dimension correctly
-        
+        mel_spec = torch.log(torch.clamp(mel_spec, min=1e-5))
+
         return mel_spec
     
     def _codebook_ids_to_audio(self, codebook_ids_list: List[List[int]]) -> Tuple[List[np.ndarray], int]:
