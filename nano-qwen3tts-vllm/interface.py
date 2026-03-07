@@ -1187,6 +1187,8 @@ class Qwen3TTSInterface:
             if next_talker_embeds.dim() == 2:
                 next_talker_embeds = next_talker_embeds.unsqueeze(0)
             generation_step = 0
+            text_tokens = trailing_text_hiddens.shape[1]
+            max_steps = max(text_tokens * 10, 120)
 
             # Direct add_request on in-process engine
             self.talker_llm.add_request([next_talker_embeds], talker_sampling_params, request_id=request_id)
@@ -1254,6 +1256,13 @@ class Qwen3TTSInterface:
                     else:
                         next_talker_embeds = next_talker_embeds + tts_pad_embed
                     generation_step += 1
+                    if generation_step >= max_steps:
+                        logger.warning(
+                            f"[gen_async:{request_id[:8]}] max_steps={max_steps} reached "
+                            f"(text_tokens={text_tokens}), forcing stop"
+                        )
+                        self.talker_llm.clear_request(request_id)
+                        break
 
                     # Direct add_request for next talker step
                     self.talker_llm.add_request(

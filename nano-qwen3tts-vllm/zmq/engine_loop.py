@@ -148,7 +148,8 @@ async def run_talker_loop(
                         f"total={((t_done - t0) * 1000):.2f}ms"
                     )
             except Exception as e:
-                raise e
+                logger.exception("[talker_loop] FATAL: engine loop died")
+                raise
             await asyncio.sleep(0)
         else:
             await asyncio.sleep(0)
@@ -231,7 +232,8 @@ async def run_predictor_loop(
                     f"publish={((t_done - t_pub) * 1000):.2f}ms"
                 )
             except Exception as e:
-                raise e
+                logger.exception("[predictor_loop] FATAL: engine loop died")
+                raise
             await asyncio.sleep(0)
         else:
             await asyncio.sleep(0)
