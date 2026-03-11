@@ -19,7 +19,7 @@ from librosa.filters import mel as librosa_mel_fn
 
 from nano_qwen3tts_vllm.utils.prompt import prepare_custom_voice_prompt, _ensure_list, _tokenize_texts
 from nano_qwen3tts_vllm.processor import Qwen3TTSProcessor
-from nano_qwen3tts_vllm.utils.generation import prepare_inputs, generate_speaker_prompt, generate_icl_prompt
+from nano_qwen3tts_vllm.utils.generation import prepare_inputs, generate_speaker_prompt, generate_icl_prompt, extend_trailing_text_hiddens
 from nano_qwen3tts_vllm.llm import TalkerLLM, PredictorLLM
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
 from nano_qwen3tts_vllm.config import Qwen3TTSConfig
@@ -991,7 +991,285 @@ class Qwen3TTSInterface:
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
         ):
             yield chunk
-    
+
+    async def generate_streaming_async(
+        self,
+        initial_text: str,
+        text_queue: asyncio.Queue,
+        voice_clone_prompt: dict,
+        language: str = "Auto",
+    ):
+        """Async generator: TTS starts from initial_text while more text arrives via text_queue.
+
+        The caller feeds LLM output chunks into text_queue as strings.
+        Send None to signal end-of-text.
+
+        Args:
+            initial_text: First chunk of text to start generating immediately.
+            text_queue: asyncio.Queue of str chunks; None signals end of text.
+            voice_clone_prompt: Pre-built voice clone prompt dict from create_voice_clone_prompt.
+            language: Language for synthesis (default "Auto").
+
+        Yields:
+            Codebook ID chunks (List[int]). Use SpeechTokenizer.decode() to convert to audio.
+        """
+        if self.zmq_bridge is None:
+            raise RuntimeError("generate_streaming_async requires zmq_bridge")
+
+        # --- tokenize helper: wrap with special tokens then strip, matching
+        #     the input_id[:, 4:-5] slice that prepare_inputs uses for
+        #     trailing_text_hiddens in streaming mode.  This ensures BPE
+        #     boundary behaviour is identical to the initial text path. ---
+        def _tok(chunk: str) -> torch.Tensor:
+            wrapped = f"<|im_start|>assistant\n{chunk}<|im_end|>\n"
+            ids = _tokenize_texts([wrapped], self.processor, self.device)
+            return ids[0][:, 3:-5]
+
+        # --- prep (reuses generate_voice_clone_async's _do_prep logic) ---
+        vc = voice_clone_prompt
+        icl_mode_enabled = vc.get("icl_mode", False)
+        ref_text_for_ids = None
+        if icl_mode_enabled:
+            ref_text_for_ids = vc.get("ref_text")
+            if ref_text_for_ids is None:
+                raise ValueError(
+                    "ICL mode enabled but ref_text not in voice_clone_prompt. "
+                    "Provide ref_text when creating the prompt."
+                )
+
+        input_text = f"<|im_start|>assistant\n{initial_text}<|im_end|>\n<|im_start|>assistant\n"
+        input_ids = _tokenize_texts([input_text], self.processor, self.device)
+
+        ref_ids = None
+        if ref_text_for_ids is not None and ref_text_for_ids != "":
+            ref_tok = _tokenize_texts(
+                [self._build_ref_text(ref_text_for_ids)], self.processor, self.device
+            )[0]
+            ref_ids = [ref_tok]
+
+        voice_clone_prompt_lists = {
+            "ref_code": [vc["ref_code"]],
+            "ref_spk_embedding": [vc["ref_spk_embedding"]],
+            "x_vector_only_mode": [vc["x_vector_only_mode"]],
+            "icl_mode": [vc["icl_mode"]],
+        }
+
+        def _gen_spk_fn(prompt):
+            return generate_speaker_prompt(prompt, self.device)
+
+        def _gen_icl_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
+            return generate_icl_prompt(
+                text_id=text_id, ref_id=ref_id, ref_code=ref_code,
+                tts_pad_embed=tts_pad_embed, tts_eos_embed=tts_eos_embed,
+                non_streaming_mode=non_streaming_mode,
+                config=self.model_config,
+                text_embedding=self.text_embedding,
+                input_embedding=self.input_embedding,
+                text_projection=self.text_projection,
+                code_predictor_embeddings=self.predictor_input_embeddings,
+                device=self.device,
+            )
+
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = prepare_inputs(
+            config=self.model_config,
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt_lists,
+            languages=[language],
+            non_streaming_mode=False,
+            text_embedding=self.text_embedding,
+            input_embedding=self.input_embedding,
+            text_projection=self.text_projection,
+            device=self.device,
+            generate_speaker_prompt_fn=_gen_spk_fn,
+            generate_icl_prompt_fn=_gen_icl_fn,
+        )
+
+        # prepare_inputs with non_streaming_mode=False appends tts_eos_embed as the
+        # last position of trailing_text_hiddens.  Strip it — we'll re-append when
+        # the caller signals end-of-text (None in queue).
+        #
+        # Precondition: trailing_text_hiddens must have >= 2 positions (text + eos).
+        # This holds when initial_text is non-empty.  In the ICL path with
+        # text_lens <= codec_lens, trailing = tts_pad_embed (1 position, no eos) —
+        # but that only happens with extremely short ref+target text which is not a
+        # valid use case for streaming.
+        tts_eos_embed_single = self.text_projection(self.text_embedding(
+            torch.tensor([[self.model_config.tts_eos_token_id]], device=self.device, dtype=torch.long)
+        ))  # [1, 1, D]
+        assert trailing_text_hiddens.shape[1] >= 2, (
+            f"trailing_text_hiddens has only {trailing_text_hiddens.shape[1]} positions; "
+            f"initial_text is too short for streaming mode"
+        )
+        trailing_text_hiddens = trailing_text_hiddens[:, :-1, :]  # strip eos
+
+        # --- generation loop (based on generate_async, with queue drain) ---
+        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
+        predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
+        request_id = str(uuid.uuid4())
+        request_queue: asyncio.Queue = asyncio.Queue()
+
+        async with self._queues_lock:
+            self._request_queues[request_id] = request_queue
+
+        try:
+            next_talker_embeds = talker_input_embeds
+            if next_talker_embeds.dim() == 2:
+                next_talker_embeds = next_talker_embeds.unsqueeze(0)
+            generation_step = 0
+            text_tokens = trailing_text_hiddens.shape[1]
+            max_steps = max(text_tokens * 10, 120)
+            expecting_more_text = True
+
+            self.talker_llm.add_request(
+                [next_talker_embeds], talker_sampling_params, request_id=request_id
+            )
+
+            while True:
+                # --- drain text_queue before each step ---
+                while expecting_more_text and not text_queue.empty():
+                    chunk = text_queue.get_nowait()
+                    if chunk is None:
+                        expecting_more_text = False
+                        # finalize: append eos to trailing_text_hiddens
+                        trailing_text_hiddens = torch.cat(
+                            [trailing_text_hiddens, tts_eos_embed_single], dim=1
+                        )
+                        break
+                    new_ids = _tok(chunk)
+                    trailing_text_hiddens = extend_trailing_text_hiddens(
+                        trailing_text_hiddens, new_ids,
+                        self.text_embedding, self.text_projection,
+                        tts_eos_embed_single, is_final=False,
+                    )
+                    max_steps = max(max_steps, trailing_text_hiddens.shape[1] * 10)
+
+                # --- wait for talker token ---
+                engine_type, msg_type, payload = await request_queue.get()
+
+                if engine_type == "talker" and msg_type == "done":
+                    self.talker_llm.clear_request(request_id)
+                    break
+
+                if engine_type == "talker" and msg_type == "token":
+                    token_ids = payload["token_ids"]
+                    hidden_states = payload.get("hidden_states")
+                    last_id = token_ids[-1]
+
+                    # --- EOS handling ---
+                    if last_id == 2150:
+                        if not expecting_more_text:
+                            self.talker_llm.clear_request(request_id)
+                            break
+                        # TTS emitted EOS but LLM text still incoming.
+                        # clear_request destroys KV cache — restarting would produce
+                        # garbage prosody.  Break cleanly and let the caller know.
+                        logger.error(
+                            f"[streaming_async:{request_id[:8]}] EOS at step={generation_step} "
+                            f"but text still expected — aborting (KV cache unrecoverable)"
+                        )
+                        self.talker_llm.clear_request(request_id)
+                        break
+
+                    # --- normal token: predictor → yield ---
+                    last_id_hidden = self.input_embedding(
+                        torch.tensor([last_id], device=self.device)
+                    ).unsqueeze(0)
+                    if hidden_states is not None:
+                        h = torch.from_numpy(hidden_states.copy()).to(self.device)
+                        last_hidden_state = h.unsqueeze(0).unsqueeze(0)
+                    else:
+                        last_hidden_state = last_id_hidden.unsqueeze(0)
+                    predictor_inputs_embeds = torch.cat(
+                        (last_hidden_state, last_id_hidden), dim=1
+                    )
+
+                    self.predictor_llm.add_request(
+                        [predictor_inputs_embeds], predictor_sampling_params,
+                        request_id=request_id,
+                    )
+
+                    _, _, payload2 = await request_queue.get()
+                    pred_token_ids = payload2.get("token_ids", [])
+                    codebook_ids = [last_id] + pred_token_ids
+                    yield codebook_ids
+
+                    # --- prepare next talker embeds ---
+                    codec_hiddens = torch.cat(
+                        [last_id_hidden]
+                        + [
+                            self.predictor_input_embeddings[i](
+                                torch.tensor([pred_token_ids[i]], device=self.device)
+                            ).unsqueeze(0)
+                            for i in range(15)
+                        ],
+                        dim=1,
+                    )
+                    next_talker_embeds = codec_hiddens.sum(1, keepdim=True)
+
+                    if generation_step < trailing_text_hiddens.shape[1]:
+                        next_talker_embeds = (
+                            next_talker_embeds
+                            + trailing_text_hiddens[:, generation_step].unsqueeze(1)
+                        )
+                    elif expecting_more_text:
+                        # Ran out of text hiddens but more text expected — await it
+                        try:
+                            chunk = await asyncio.wait_for(text_queue.get(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[streaming_async:{request_id[:8]}] text_queue timeout at "
+                                f"step={generation_step}, padding"
+                            )
+                            next_talker_embeds = next_talker_embeds + tts_pad_embed
+                        else:
+                            if chunk is None:
+                                expecting_more_text = False
+                                trailing_text_hiddens = torch.cat(
+                                    [trailing_text_hiddens, tts_eos_embed_single], dim=1
+                                )
+                            else:
+                                new_ids = _tok(chunk)
+                                trailing_text_hiddens = extend_trailing_text_hiddens(
+                                    trailing_text_hiddens, new_ids,
+                                    self.text_embedding, self.text_projection,
+                                    tts_eos_embed_single, is_final=False,
+                                )
+                                max_steps = max(
+                                    max_steps, trailing_text_hiddens.shape[1] * 10
+                                )
+                            # After extending, try to use the new position
+                            if generation_step < trailing_text_hiddens.shape[1]:
+                                next_talker_embeds = (
+                                    next_talker_embeds
+                                    + trailing_text_hiddens[:, generation_step].unsqueeze(1)
+                                )
+                            else:
+                                next_talker_embeds = next_talker_embeds + tts_pad_embed
+                    else:
+                        next_talker_embeds = next_talker_embeds + tts_pad_embed
+
+                    generation_step += 1
+                    if generation_step >= max_steps:
+                        logger.warning(
+                            f"[streaming_async:{request_id[:8]}] max_steps={max_steps} "
+                            f"reached, forcing stop"
+                        )
+                        self.talker_llm.clear_request(request_id)
+                        break
+
+                    self.talker_llm.add_request(
+                        [next_talker_embeds], talker_sampling_params,
+                        request_id=request_id,
+                    )
+        finally:
+            try:
+                self.talker_llm.clear_request(request_id)
+            except Exception:
+                pass
+            async with self._queues_lock:
+                self._request_queues.pop(request_id, None)
+
     def generate_voice_design(
         self,
         text: str,

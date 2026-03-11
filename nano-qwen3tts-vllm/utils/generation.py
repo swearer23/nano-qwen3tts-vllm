@@ -517,3 +517,35 @@ def generate_icl_prompt(
         else:
             text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
             return text_embed + codec_embed, tts_pad_embed
+
+
+@torch.inference_mode()
+def extend_trailing_text_hiddens(
+    existing: torch.Tensor,        # [1, T_existing, D]
+    new_text_ids: torch.Tensor,    # [1, T_new]
+    text_embedding,
+    text_projection,
+    tts_eos_embed: torch.Tensor,   # [1, 1, D]
+    is_final: bool = False,
+) -> torch.Tensor:
+    """Extend trailing_text_hiddens with new text token embeddings.
+
+    Used by streaming text input: as new text chunks arrive from an LLM,
+    they are tokenized and their projected embeddings are appended to the
+    existing trailing_text_hiddens tensor so the talker can consume them.
+
+    Args:
+        existing: Current trailing_text_hiddens [1, T_existing, D].
+        new_text_ids: New text token IDs [1, T_new] (raw tokens, no special tokens).
+        text_embedding: Callable that maps token IDs to embeddings.
+        text_projection: Callable that projects text embeddings to hidden dim.
+        tts_eos_embed: TTS EOS embedding [1, 1, D], appended when is_final=True.
+        is_final: If True, append tts_eos_embed after new_hiddens (signals end of text).
+
+    Returns:
+        Extended trailing_text_hiddens [1, T_existing + T_new (+ 1 if final), D].
+    """
+    new_hiddens = text_projection(text_embedding(new_text_ids))
+    if is_final:
+        new_hiddens = torch.cat([new_hiddens, tts_eos_embed], dim=1)
+    return torch.cat([existing, new_hiddens], dim=1)
