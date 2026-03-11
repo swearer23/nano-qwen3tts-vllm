@@ -1465,7 +1465,9 @@ class Qwen3TTSInterface:
             if next_talker_embeds.dim() == 2:
                 next_talker_embeds = next_talker_embeds.unsqueeze(0)
             generation_step = 0
-            text_tokens = trailing_text_hiddens.shape[1]
+            # non_streaming_mode=True: text tokens live in inputs_embeds, trailing=1
+            # non_streaming_mode=False: text tokens live in trailing_text_hiddens
+            text_tokens = max(trailing_text_hiddens.shape[1], inputs_embeds.shape[1])
             max_steps = max(text_tokens * 10, 120)
 
             # Direct add_request on in-process engine
