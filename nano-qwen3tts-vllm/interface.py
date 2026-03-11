@@ -1097,11 +1097,11 @@ class Qwen3TTSInterface:
         tts_eos_embed_single = self.text_projection(self.text_embedding(
             torch.tensor([[self.model_config.tts_eos_token_id]], device=self.device, dtype=torch.long)
         ))  # [1, 1, D]
-        if trailing_text_hiddens.shape[1] >= 2:
-            trailing_text_hiddens = trailing_text_hiddens[:, :-1, :]  # strip eos
-        else:
-            # ICL mode: all initial text consumed into ICL prompt, no trailing
-            trailing_text_hiddens = trailing_text_hiddens[:, :0, :]  # empty [1, 0, D]
+        assert trailing_text_hiddens.shape[1] >= 2, (
+            f"trailing_text_hiddens has only {trailing_text_hiddens.shape[1]} positions; "
+            f"initial_text is too short for streaming mode"
+        )
+        trailing_text_hiddens = trailing_text_hiddens[:, :-1, :]  # strip eos
 
         # --- generation loop (based on generate_async, with queue drain) ---
         talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
