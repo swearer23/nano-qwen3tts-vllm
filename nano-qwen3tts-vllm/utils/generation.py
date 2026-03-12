@@ -515,15 +515,8 @@ def generate_icl_prompt(
         if text_lens > codec_lens:
             return text_embed[:, :codec_lens] + codec_embed, text_embed[:, codec_lens:]
         else:
-            # Keep last 2 text positions (text + eos) as trailing so the model
-            # knows text isn't finished yet — prevents premature EOS.
-            # ICL portion gets remaining text padded to codec_lens.
-            keep_trailing = min(2, text_lens)
-            icl_text = text_embed[:, :text_lens - keep_trailing]
-            trailing = text_embed[:, text_lens - keep_trailing:]
-            pad_count = codec_lens - icl_text.shape[1]
-            icl_padded = torch.cat([icl_text] + [tts_pad_embed] * pad_count, dim=1)
-            return icl_padded + codec_embed, trailing
+            text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
+            return text_embed + codec_embed, tts_pad_embed
 
 
 @torch.inference_mode()
